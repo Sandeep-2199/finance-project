@@ -2,8 +2,7 @@
 .DS_Store
 
 # Ignore Python virtual environment
-venv/
-research/
+kafka_env/
 
 # Ignore log files
 *.log
