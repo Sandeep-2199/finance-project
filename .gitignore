@@ -3,6 +3,7 @@
 
 # Ignore Python virtual environment
 kafka_env/
+kafka/
 
 # Ignore log files
 *.log
