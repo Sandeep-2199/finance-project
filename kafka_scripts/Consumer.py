@@ -1,151 +1,157 @@
-from confluent_kafka import Consumer, KafkaError
+from confluent_kafka import Consumer, KafkaError, KafkaException
 import json
-import time
-import os
+import logging
+import signal
+import sys
+import importlib.util
+from typing import Dict, Any
 
-# Kafka configuration
-KAFKA_BROKER = "localhost:9092"
-TOPICS = ['dataset_1', 'dataset_2', 'dataset_3', 'dataset_4']
-CONSUMER_GROUP = 'lending-club-consumer-group'
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('kafka_consumer')
 
-# Consumer configuration
-consumer_config = {
-    'bootstrap.servers': KAFKA_BROKER,
-    'group.id': CONSUMER_GROUP,
-    'auto.offset.reset': 'earliest',
-    'enable.auto.commit': False,
-    'max.poll.interval.ms': 300000,
-    'session.timeout.ms': 10000
-}
-
-# Create Consumer instance
-consumer = Consumer(consumer_config)
-
-# Subscribe to topics
-consumer.subscribe(TOPICS)
-
-# Counter for metrics
-message_count = 0
-start_time = time.time()
-
-def process_message(topic, message_data):
-    """
-    Process the received message - add your transformation logic here
-    """
-    print(f"Received message from {topic}")
-    
-    # Example transformation
-    transformed_data = message_data.copy()
-    transformed_data['processed_timestamp'] = int(time.time() * 1000)
-    transformed_data['consumer_group'] = CONSUMER_GROUP
-    
-    # Add topic-specific processing
-    if topic == 'dataset_1':
-        transformed_data['data_type'] = 'customer_data'
-    elif topic == 'dataset_2':
-        transformed_data['data_type'] = 'loan_data' 
-    elif topic == 'dataset_3':
-        transformed_data['data_type'] = 'defaulter_data'
-    elif topic == 'dataset_4':
-        transformed_data['data_type'] = 'repayment_data'
-    
-    return transformed_data
-
-def save_to_database(data):
-    """
-    Save processed data to your database - implement your storage logic here
-    """
-    # Example: Print to console (replace with actual database insert)
-    print(f"Saving to DB: {data['data_type']} with ID: {data.get('id', 'N/A')}")
-    
-    # Actual implementations might include:
-    # - Writing to PostgreSQL/MySQL
-    # - Saving to Elasticsearch  
-    # - Storing in MongoDB
-    # - Writing to a data warehouse
-    pass
-
-def save_to_file(topic, data):
-    """
-    Alternative: Save processed data to topic-specific files
-    """
-    output_dir = "processed_data"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    from datetime import datetime
-    filename = f"{output_dir}/{topic}_{datetime.now().strftime('%Y%m%d')}.jsonl"
-    
-    with open(filename, 'a') as f:
-        f.write(json.dumps(data) + '\n')
-    
-    return filename
-
-try:
-    print("Starting Kafka Consumer")
-    print(f"Listening to topics: {TOPICS}")
-    print("Press Ctrl+C to stop the consumer")
-    print("")
-    
-    while True:
-        # Poll for messages with timeout
-        msg = consumer.poll(1.0)
+class KafkaMessageConsumer:
+    def __init__(self, bootstrap_servers: str = 'localhost:9092', group_id: str = 'lending_club_group'):
+        self.bootstrap_servers = bootstrap_servers
+        self.group_id = group_id
+        self.running = False
+        self.consumer = None
         
-        if msg is None:
-            continue
-            
-        if msg.error():
-            if msg.error().code() == KafkaError._PARTITION_EOF:
-                print(f"Reached end of {msg.topic()} partition {msg.partition()}")
-            else:
-                print(f"Consumer error: {msg.error()}")
-            continue
+        # Topics to consume from - these should match what your transformation files produce to
+        self.topics = [
+            'transformed_customers',      # from transformations/customer_data.py
+            'transformed_loans',          # from transformations/loans_data.py  
+            'transformed_defaulters',     # from transformations/loans_defaulters.py
+            'transformed_repayments',     # from transformations/loans_repayments.py
+        ]
+        
+        # Dynamically load transformation functions if needed
+        self.transformation_functions = self.load_transformation_functions()
 
-        # Successfully received a message
+    def load_transformation_functions(self):
+        """Dynamically load process functions from transformation modules"""
+        functions = {}
         try:
-            # Decode the message
-            message_data = json.loads(msg.value().decode('utf-8'))
-            message_count += 1
+            # Import and get the process function from each transformation module
+            from transformations.customer_data import process_transformed_customer
+            from transformations.loans_data import process_transformed_loan
+            from transformations.loans_defaulters import process_transformed_defaulter
+            from transformations.loans_repayments import process_transformed_repayment
             
-            # Process the message
-            processed_data = process_message(msg.topic(), message_data)
+            functions = {
+                'transformed_customers': process_transformed_customer,
+                'transformed_loans': process_transformed_loan,
+                'transformed_defaulters': process_transformed_defaulter,
+                'transformed_repayments': process_transformed_repayment,
+            }
+            logger.info("Successfully loaded all transformation functions")
             
-            # Choose one saving method:
-            
-            # Option 1: Save to database
-            save_to_database(processed_data)
-            
-            # Option 2: Save to file (uncomment below)
-            # output_file = save_to_file(msg.topic(), processed_data)
-            # print(f"Saved to file: {output_file}")
-            
-            # Print progress every 100 messages
-            if message_count % 100 == 0:
-                elapsed_time = time.time() - start_time
-                rate = message_count / elapsed_time if elapsed_time > 0 else 0
-                print(f"Processed {message_count} messages | Rate: {rate:.2f} msg/sec")
-            
-            # Commit offset manually
-            consumer.commit(async=False)
-            
-        except json.JSONDecodeError as e:
-            print(f"JSON decode error: {e}")
-        except Exception as e:
-            print(f"Processing error: {e}")
+        except ImportError as e:
+            logger.warning(f"Could not import transformation functions: {e}")
+            logger.warning("Using default processing methods")
+        
+        return functions
 
-except KeyboardInterrupt:
-    print("Consumer interrupted by user")
-    
-finally:
-    # Clean up on exit
-    print("Cleaning up consumer")
-    consumer.close()
-    
-    # Print final statistics
-    elapsed_time = time.time() - start_time
-    print("")
-    print("Final Statistics:")
-    print(f"Total messages processed: {message_count}")
-    print(f"Total time: {elapsed_time:.2f} seconds")
-    if elapsed_time > 0:
-        print(f"Average rate: {message_count/elapsed_time:.2f} messages/second")
-    print("Consumer stopped successfully")
+    def create_consumer(self) -> Consumer:
+        """Create and configure Kafka consumer"""
+        consumer_config = {
+            'bootstrap.servers': self.bootstrap_servers,
+            'group.id': self.group_id,
+            'auto.offset.reset': 'earliest',
+            'enable.auto.commit': False,
+        }
+        
+        return Consumer(consumer_config)
+
+    def process_message(self, topic: str, message: Dict[str, Any]) -> None:
+        """
+        Process message using the appropriate transformation function
+        """
+        try:
+            # Use the dynamically loaded function if available
+            if topic in self.transformation_functions:
+                self.transformation_functions[topic](message)
+            else:
+                # Fallback to default processing
+                self.default_message_processing(topic, message)
+                
+        except Exception as e:
+            logger.error(f"Error processing message from topic {topic}: {e}")
+            logger.error(f"Message content: {message}")
+
+    def default_message_processing(self, topic: str, message: Dict[str, Any]) -> None:
+        """Default processing if no specific function is found"""
+        logger.info(f"Processing {topic}: {message.get('id', 'Unknown ID')}")
+        
+        # Add your default processing logic here
+        # This could be writing to a database, cache, etc.
+        
+        if 'customer' in topic:
+            logger.debug(f"Customer data: {message}")
+        elif 'loan' in topic:
+            logger.debug(f"Loan data: {message}")
+        elif 'defaulter' in topic:
+            logger.debug(f"Defaulter data: {message}")
+        elif 'repayment' in topic:
+            logger.debug(f"Repayment data: {message}")
+
+    def start_consuming(self) -> None:
+        """Start consuming messages from all topics"""
+        self.consumer = self.create_consumer()
+        self.consumer.subscribe(self.topics)
+        self.running = True
+        
+        logger.info(f"Starting consumer for topics: {self.topics}")
+        logger.info("Press Ctrl+C to stop...")
+        
+        try:
+            while self.running:
+                msg = self.consumer.poll(1.0)
+                
+                if msg is None:
+                    continue
+                    
+                if msg.error():
+                    if msg.error().code() == KafkaError._PARTITION_EOF:
+                        continue
+                    logger.error(f"Consumer error: {msg.error()}")
+                    continue
+                
+                try:
+                    message_value = json.loads(msg.value().decode('utf-8'))
+                    
+                    logger.info(f"Received from '{msg.topic()}' [Partition: {msg.partition()}]")
+                    
+                    self.process_message(msg.topic(), message_value)
+                    
+                    # Commit offset after successful processing
+                    self.consumer.commit()
+                    
+                except Exception as e:
+                    logger.error(f"Error processing message: {e}")
+                    
+        except KeyboardInterrupt:
+            logger.info("Consumer interrupted by user")
+        finally:
+            self.shutdown()
+
+    def shutdown(self) -> None:
+        """Clean shutdown"""
+        logger.info("Shutting down consumer...")
+        self.running = False
+        if self.consumer:
+            self.consumer.close()
+
+def signal_handler(sig, frame):
+    logger.info("Interrupt signal received")
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+if __name__ == "__main__":
+    consumer = KafkaMessageConsumer()
+    consumer.start_consuming()
